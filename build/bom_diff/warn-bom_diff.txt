@@ -21,7 +21,7 @@ missing module named _posixsubprocess - imported by subprocess (conditional), mu
 missing module named fcntl - imported by subprocess (optional), xmlrpc.server (optional)
 missing module named urllib.urlopen - imported by urllib (delayed, optional), lxml.html (delayed, optional)
 missing module named urllib.urlencode - imported by urllib (delayed, optional), lxml.html (delayed, optional)
-missing module named posix - imported by os (conditional, optional), shutil (conditional), importlib._bootstrap_external (conditional), posixpath (optional)
+missing module named posix - imported by os (conditional, optional), posixpath (optional), shutil (conditional), importlib._bootstrap_external (conditional)
 missing module named resource - imported by posix (top-level)
 missing module named _manylinux - imported by packaging._manylinux (delayed, optional), setuptools._vendor.packaging._manylinux (delayed, optional), setuptools._vendor.wheel.vendored.packaging._manylinux (delayed, optional)
 missing module named typing_extensions.TypeAlias - imported by setuptools._vendor.typing_extensions (top-level), setuptools._distutils.compilers.C.base (conditional), setuptools._reqs (conditional), setuptools.warnings (conditional), setuptools._path (conditional), setuptools._distutils.dist (conditional), setuptools.config.setupcfg (conditional), setuptools.config._apply_pyprojecttoml (conditional), setuptools.dist (conditional), pkg_resources (conditional), setuptools.command.bdist_egg (conditional), setuptools.compat.py311 (conditional)

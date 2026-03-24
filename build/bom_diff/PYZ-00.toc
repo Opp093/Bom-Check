@@ -1,4 +1,4 @@
-('C:\\Users\\A\\Desktop\\release-1.0\\build\\bom_diff\\PYZ-00.pyz',
+('C:\\Users\\A\\Desktop\\Bom-Check\\build\\bom_diff\\PYZ-00.pyz',
  [('PIL',
    'K:\\work\\minGW\\ucrt64\\lib\\python3.12\\site-packages\\PIL\\__init__.py',
    'PYMODULE'),
