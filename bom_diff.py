@@ -72,13 +72,31 @@ def generate_bom_excel(old_bom_path, new_bom_path, output_filename="BOM_差异�
         row_data = {'变更类型': '[*] 修改', '位号': key}
         has_diff = False
         
-        for col in old_df.columns:
-            if col in new_df.columns:
+        # 1. 构建全集引脚网络 (提取所有出现过的列名)
+        all_cols = list(old_df.columns)
+        for c in new_df.columns:
+            if c not in all_cols:
+                all_cols.append(c)
+                
+        # 2. 遍历全集引脚进行三态逻辑判断
+        for col in all_cols:
+            in_old = col in old_df.columns
+            in_new = col in new_df.columns
+            
+            # 状态 A：新旧板子都有这个引脚 -> 对比电平值
+            if in_old and in_new:
                 if str(old_row[col]) != str(new_row[col]):
                     row_data[col] = f"[{old_row[col]}] -> [{new_row[col]}]"
                     has_diff = True
-            else:
+                    
+            # 状态 B：旧板有，新板没有 -> 报新版缺失
+            elif in_old and not in_new:
                 row_data[col] = "[新版缺失此列]"
+                has_diff = True
+                
+            # 状态 C：新板有，旧板没有 -> 报旧版缺失
+            elif not in_old and in_new:
+                row_data[col] = "[旧版缺失此列]"
                 has_diff = True
         
         if has_diff: 
