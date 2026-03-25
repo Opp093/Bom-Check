@@ -433,7 +433,7 @@ def show_instructions(root):
 
     # ==================== [核心重构：防篡改的内置固化存储] ====================
     # 👨‍💻 开发者专属修改区：直接在这里修改文字，然后用 PyInstaller 重新打包即可！
-    developer_instructions = """欢迎使用 Excite Bom-check HW V4.0!
+    developer_instructions = """欢迎使用 Excite Bom-check HW V4.1!
 
 【模式 A:硬件改版差异核对】
 1. 作用：对比新旧两份 BOM,提取新增、移除、修改(包括变为空贴)的器件。
@@ -469,7 +469,7 @@ def show_instructions(root):
 
 def run_app():
     root = tk.Tk()
-    root.title("BOM-Check V4.0 ")
+    root.title("BOM-Check V4.1 ")
     root.geometry("760x540") # 稍微拉宽以容纳帮助按钮
     root.configure(bg="#EAECEE") 
     
@@ -480,7 +480,7 @@ def run_app():
     
     gradient = GradientHeader(header_frame, color1="#1A2980", color2="#26D0CE", highlightthickness=0)
     gradient.place(relwidth=1, relheight=1)
-    tk.Label(header_frame, text="Excite BOM-Check HW V4.0", font=("Microsoft YaHei", 18, "bold"), 
+    tk.Label(header_frame, text="Excite BOM-Check HW V4.1", font=("Microsoft YaHei", 18, "bold"), 
              fg="white", bg="#1A2980").place(relx=0.5, rely=0.5, anchor="center")
 
     # ---------------- 2. 引入基础样式 ----------------
