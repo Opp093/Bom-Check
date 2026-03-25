@@ -12,6 +12,7 @@ from openpyxl.styles import PatternFill, Font
 # 引脚重映射字典：包含你见过的所有奇葩表头
 ALIAS_DICT = {
     'Designator': ['位号', 'designator', 'refdes', 'reference', '编号'],
+    'Quantity': ['数量', 'quantity', 'qty', 'count', '用量'], 
     'DNP': ['贴片状态', 'dnp', 'nc', '是否贴片', 'status', '空贴'],
     'K3_Code': ['k3 no.', 'k3 no', 'k3编码', '物料代码', '物料编码', 'k3 code', '编码'],
     'Value': ['value', '值', '参数', '规格型号', '容值', '阻值'],
@@ -38,12 +39,17 @@ def get_footprint_core(val):
     return s
 
 def expand_value(val):
-    """等效参数发生器：处理 100nF=0.1uF, 1MR=1M 等单位换算。极致防爆版"""
+    """等效参数发生器：处理 100nF=0.1uF 等单位换算。极致防爆版"""
     val = str(val).strip().upper()
     
-    # [核心修复 1：空信号旁路] 如果传入的是空值，直接返回空列表，彻底停止裂变！
+    # [空信号旁路] 如果传入的是空值，直接返回空列表
     if not val: 
         return []
+
+    # ================= [核心修复：精度符号对称清洗] =================
+    # 抹除 AD 参数中的 ± 和 +/-，使其与 K3 库实现绝对对称匹配
+    val = val.replace('±', '').replace('+/-', '')
+    # ================================================================
 
     val = val.replace('Ω', '') 
     val = re.sub(r'([KMG])R$', r'\1', val) # 1MR -> 1M
@@ -76,9 +82,7 @@ def expand_value(val):
             
     # 全局无 F 后缀补充
     for e in list(eqs):
-        # [核心修复 2：空字符绝缘层] 再次确保处理的不是空串
         if not e: continue 
-        
         if e.endswith('F'): 
             eqs.add(e[:-1])
         elif e[-1] in ['P', 'N', 'U', 'M']: 
@@ -250,14 +254,17 @@ def process_lib_check(ad_path, lib_path, output_filename):
         k3_code = str(row.get('K3_Code', '')).strip()
         ad_val = str(row.get('Value', '')).strip()
         ad_foot = str(row.get('Footprint', '')).strip()
+        ad_qty = str(row.get('Quantity', '')).strip() # <--- [新增] 提取数量数据
         
         row_data = {
-            '位号 (Designator)': row.get('Designator', ''),
+            '位号 (Designator)': str(row.get('Designator', '')),
+            '数量 (Qty)': ad_qty,  # <--- [新增] 将数量接入输出总线
             'AD K3编码': k3_code,
             'AD 原理图参数': f"Val: {ad_val} | Foot: {ad_foot}",
             '校验状态': '',
             '公司 K3 库标准参数': ''
         }
+        # ... 后面的状态机和切片逻辑保持完全不变 ...
 
         # 状态机 A：缺件或彻底找不到
         if k3_code in ['', 'nan', 'NONE']:
@@ -265,31 +272,73 @@ def process_lib_check(ad_path, lib_path, output_filename):
         elif k3_code not in lib_dict:
             row_data['校验状态'] = '[x] 库中无此物料'
             
-        # 状态机 B：编码存在 -> 进入深度交叉验证
+        # 状态机 B：编码存在 -> 启动深度交叉验证
         else:
-            k3_specs_str = lib_dict[k3_code]
-            k3_specs_upper = k3_specs_str.upper() # 将 K3 规格转化为大写进行底噪抹平
+            k3_specs_upper = str(lib_dict[k3_code]).upper()
+            # ================= [核心终极修复：对称底噪抹平] =================
+            # AD 的信号在底层被抹去了 Ω 和 ±，K3 库也必须同等抹去，否则会引发非对称断路！
+            k3_specs_upper = k3_specs_upper.replace('Ω', '').replace('±', '').replace('+/-', '')
+            # ================================================================
+            designator_upper = str(row.get('Designator', '')).strip().upper()
             
-            # --- 通道 1：封装滤波器检测 ---
-            foot_core = get_footprint_core(ad_foot)
-            match_foot = (foot_core == '') or (foot_core in k3_specs_upper)
-            
-            # --- 通道 2：参数裂变器扫描 (多波段并发) ---
-            val_eqs = expand_value(ad_val) 
-            # 只要裂变出的参数（如 0.1UF, 100NF）有任意一个命中 K3，即视作匹配！
-            match_val = (ad_val == '') or any(eq in k3_specs_upper for eq in val_eqs)
-            
-            # --- 与门 (AND Gate) 仲裁判断 ---
-            if match_val and match_foot:
-                row_data['校验状态'] = '[√] 完美匹配'
-            else:
-                # 捕获冲突并明确报出是哪个引脚对不上
-                conflicts = []
-                if not match_val: conflicts.append(f"参数({ad_val})冲突")
-                if not match_foot: conflicts.append(f"封装({ad_foot})冲突")
-                row_data['校验状态'] = f'[!] {", ".join(conflicts)}'
+            # ================= [防线升级 1] DNP 空贴噪声剥离与状态捕捉 =================
+            is_row_dnp = False
+            # 1. 检查是否存在专属的 DNP 列
+            if 'DNP' in ad_df.columns and is_dnp(str(row.get('DNP', ''))):
+                is_row_dnp = True
+            # 2. 检查 Value 列是否夹杂了 DNP 字眼 (如 10K_DNP 或 0.1uF/NC)
+            elif is_dnp(ad_val):
+                is_row_dnp = True
                 
-            row_data['公司 K3 库标准参数'] = k3_specs_str
+            # 从 Value 中强行洗掉 DNP/NC/空贴 等噪音字眼，防止污染后续的切片校验
+            clean_ad_val = ad_val.upper()
+            
+            # 【终极修复】应用严格的字母数字边界判定，彻底放过 NC7SZ 等芯片型号
+            for kw in ['DNP', 'NC']:
+                # (?<![A-Z0-9]) 确保前面不是字母或数字
+                # (?![A-Z0-9])  确保后面不是字母或数字
+                clean_ad_val = re.sub(r'(?<![A-Z0-9])' + kw + r'(?![A-Z0-9])', '', clean_ad_val)
+            
+            # 中文“空贴”不会与芯片型号重合，直接无脑切除即可
+            clean_ad_val = re.sub(r'空贴', '', clean_ad_val)
+            # =========================================================================
+
+            # --- 通道 1：封装滤波器检测 (加装智能旁路路由) ---
+            foot_core = get_footprint_core(ad_foot)
+            is_rc_passive = re.match(r'^(R|C|RN|CN)\d+', designator_upper)
+            
+            if is_rc_passive:
+                match_foot = (foot_core == '') or (foot_core in k3_specs_upper)
+            else:
+                match_foot = True
+            
+            # --- 通道 2：参数裂变器扫描 (多维交叉切片) ---
+            # 【注意】这里使用洗净了 DNP 噪音的 clean_ad_val 进行切片
+            sub_vals = [s.strip() for s in re.split(r'[_,\/\|\s]+', clean_ad_val) if s.strip()]
+            
+            match_val = True
+            val_conflicts = [] 
+            
+            for sv in sub_vals:
+                # [核心修正] 拆除 K3 编码套娃旁路，强制对 Value 列的所有切片进行物理参数校验
+                sv_eqs = expand_value(sv) 
+                if not any(eq in k3_specs_upper for eq in sv_eqs):
+                    match_val = False
+                    val_conflicts.append(sv)
+            
+            # --- 与门仲裁 ---
+            # 如果捕捉到了 DNP 状态，准备好专属后缀标签
+            dnp_tag = " (空贴/DNP)" if is_row_dnp else ""
+            
+            if match_val and match_foot:
+                row_data['校验状态'] = f'[√] 完美匹配{dnp_tag}'
+            else:
+                conflicts = []
+                if not match_val: conflicts.append(f"参数({','.join(val_conflicts)})冲突")
+                if not match_foot: conflicts.append(f"封装({ad_foot})冲突")
+                row_data['校验状态'] = f'[!] {", ".join(conflicts)}{dnp_tag}'
+                
+            row_data['公司 K3 库标准参数'] = lib_dict[k3_code]
             
         # ==================== [核心修复：焊接数据输出引脚] ====================
         excel_data.append(row_data) 
@@ -303,8 +352,6 @@ def process_lib_check(ad_path, lib_path, output_filename):
     result_df.sort_values(by=['校验状态', '位号 (Designator)'], inplace=True)
     result_df.to_excel(output_filename, index=False)
     render_excel(output_filename, 'check')
-
-# ==================== Module 4: 渲染层 (LED 色彩驱动) ====================
 
 # ==================== Module 4: 渲染层 (莫兰迪护眼色彩驱动) ====================
 
@@ -336,7 +383,8 @@ def render_excel(filename, mode):
     elif mode == 'check':
         fills = {'[x]': soft_red, '[!]': soft_orange, '[√]': soft_green}
         for row in range(2, ws.max_row + 1):
-            val = str(ws.cell(row=row, column=4).value)
+            # [核心修正] 因为插入了数量列，校验状态偏移到了第 5 列，寻址指针随之修改
+            val = str(ws.cell(row=row, column=5).value) 
             for key in fills:
                 if key in val:
                     for c in ws[row]: 
@@ -347,87 +395,188 @@ def render_excel(filename, mode):
     wb.save(filename)
     messagebox.showinfo("执行完毕", f"🎉 报表生成成功！\n已应用护眼色彩渲染，保存在:\n{filename}")
 
-# ==================== Module 5: 人机交互界面 (现代扁平化 UI) ====================
+# ==================== Module 5: 人机交互界面 (自研机械导航引擎 + 动态说明书版) ====================
+
+class GradientHeader(tk.Canvas):
+    """自研 CPU 软件渲染器：通过逐行扫描绘制高拟真渐变背景"""
+    def __init__(self, parent, color1, color2, **kwargs):
+        super().__init__(parent, **kwargs)
+        self._color1 = color1
+        self._color2 = color2
+        self.bind("<Configure>", self._draw_gradient)
+
+    def _draw_gradient(self, event=None):
+        self.delete("gradient")
+        width, height = self.winfo_width(), self.winfo_height()
+        if width <= 1 or height <= 1: return 
+        
+        r1, g1, b1 = self.winfo_rgb(self._color1)
+        r2, g2, b2 = self.winfo_rgb(self._color2)
+        r_ratio, g_ratio, b_ratio = (r2-r1)/width, (g2-g1)/width, (b2-b1)/width
+
+        for i in range(width):
+            nr, ng, nb = int(r1 + (r_ratio * i)), int(g1 + (g_ratio * i)), int(b1 + (b_ratio * i))
+            color = "#%4.4x%4.4x%4.4x" % (nr, ng, nb)
+            self.create_line(i, 0, i, height, tags=("gradient",), fill=color)
+        self.tag_lower("gradient")
+
+def show_instructions(root):
+    """编译期固化说明书引擎：防篡改，仅开发者可通过重新打包修改"""
+    help_win = tk.Toplevel(root)
+    help_win.title("📖 Bom-Check使用说明")
+    help_win.geometry("580x460")
+    help_win.configure(bg="#EAECEE")
+    
+    # 设置模态窗口（置顶，且必须关闭后才能操作主界面）
+    help_win.transient(root)
+    help_win.grab_set()
+
+    # ==================== [核心重构：防篡改的内置固化存储] ====================
+    # 👨‍💻 开发者专属修改区：直接在这里修改文字，然后用 PyInstaller 重新打包即可！
+    developer_instructions = """欢迎使用 Excite Bom-check HW V4.0!
+
+【模式 A:硬件改版差异核对】
+1. 作用：对比新旧两份 BOM,提取新增、移除、修改(包括变为空贴)的器件。
+2. 注：两份表头必须包含“位号”"k3 no"列。
+
+【模式 B:首次发板 K3 校验】
+1. 作用：将 EDA 导出的 BOM 与公司 K3 库进行三维交叉比对(K3 No.+Value+Footprint)。
+2. 高级特性：
+   - 自动等效换算:100nF=0.1uF,1MR=1M 等。
+   - DNP 状态剥离：自动从参数中剔除 DNP/NC/空贴 字符。(需要将DNP参数写在Value中)
+   - 智能旁路路由：芯片(U)、电感(L)、二极管(D) 等物料,由于K3中不会存在封装信息,所以屏蔽封装检测,检测value与K3编码
+   
+=========================================
+⚠️ 内部管控工具，请勿外传。
+如有增加新物料规则或功能需求，请联系工具开发者。"""
+    # ==========================================================================
+
+    # 渲染滚动文本视窗
+    txt_frame = tk.Frame(help_win, bd=2, relief=tk.SUNKEN)
+    txt_frame.pack(expand=True, fill='both', padx=20, pady=20)
+
+    txt = tk.Text(txt_frame, font=("Microsoft YaHei", 10), bg="#FDFEFE", fg="#2C3E50", wrap="word", padx=10, pady=10)
+    scrollbar = ttk.Scrollbar(txt_frame, command=txt.yview)
+    txt.configure(yscrollcommand=scrollbar.set)
+    
+    scrollbar.pack(side='right', fill='y')
+    txt.pack(side='left', expand=True, fill='both')
+    
+    # 将内置的固化文字插入到界面中
+    txt.insert('1.0', developer_instructions)
+    # [安全锁] 彻底锁定文本框，禁止用户在界面上敲击键盘篡改内容
+    txt.config(state='disabled')
 
 def run_app():
     root = tk.Tk()
-    root.title("BOM 智能协同中枢 V4.0")
-    root.geometry("680x420") # 稍微拉宽界面，更显大气
-    root.configure(bg="#F2F4F4") # 窗口底色改为极浅的冷灰色
+    root.title("BOM-Check V4.0 ")
+    root.geometry("760x540") # 稍微拉宽以容纳帮助按钮
+    root.configure(bg="#EAECEE") 
     
-    # 启用现代扁平化主题引擎
+    # ---------------- 1. 顶部炫酷渐变横幅 ----------------
+    header_frame = tk.Frame(root, height=60)
+    header_frame.pack(fill='x')
+    header_frame.pack_propagate(False) 
+    
+    gradient = GradientHeader(header_frame, color1="#1A2980", color2="#26D0CE", highlightthickness=0)
+    gradient.place(relwidth=1, relheight=1)
+    tk.Label(header_frame, text="Excite BOM-Check HW V4.0", font=("Microsoft YaHei", 18, "bold"), 
+             fg="white", bg="#1A2980").place(relx=0.5, rely=0.5, anchor="center")
+
+    # ---------------- 2. 引入基础样式 ----------------
     style = ttk.Style()
-    if 'clam' in style.theme_names():
-        style.theme_use('clam')
-        
-    # 定义全局组件样式
+    if 'clam' in style.theme_names(): style.theme_use('clam')
     font_main = ("Microsoft YaHei", 10)
     font_bold = ("Microsoft YaHei", 10, "bold")
     
-    style.configure("TNotebook", background="#F2F4F4")
-    style.configure("TNotebook.Tab", padding=[20, 8], font=font_bold, background="#E5E8E8")
-    style.map("TNotebook.Tab", background=[("selected", "#FFFFFF")], foreground=[("selected", "#2980B9")])
-    
-    style.configure("TFrame", background="#FFFFFF")
-    style.configure("TLabelframe", background="#FFFFFF", font=font_bold, foreground="#34495E")
+    style.configure("TLabelframe", background="#FFFFFF", font=font_bold, foreground="#2E4053")
     style.configure("TLabelframe.Label", background="#FFFFFF")
-    style.configure("TButton", padding=6, font=font_main)
-    style.configure("TEntry", padding=6)
+
+    # ==================== [核心重构：带有帮助按钮的导航矩阵] ====================
+    nav_frame = tk.Frame(root, bg="#EAECEE")
+    nav_frame.pack(fill='x', pady=15, padx=20)
     
-    notebook = ttk.Notebook(root)
-    notebook.pack(pady=15, padx=20, expand=True, fill='both')
+    # 建立帮助按钮 (靠右放置，小巧精致)
+    btn_help = tk.Button(nav_frame, text="📖 使用说明", font=("Microsoft YaHei", 10, "bold"), 
+                         fg="#2980B9", bg="#EAECEE", relief=tk.GROOVE, bd=2, cursor="hand2",
+                         command=lambda: show_instructions(root))
+    btn_help.pack(side='right', fill='y', padx=(10, 0))
     
-    # ---------------- 选项卡 1：差异核对 ----------------
-    tab_a = ttk.Frame(notebook)
-    notebook.add(tab_a, text=" 🔄 [模式 A] 硬件改版差异核对 ")
+    # 建立两个宏大的物理按键
+    btn_a = tk.Button(nav_frame, text="🔄 模式 A：差异核对", font=("Microsoft YaHei", 12, "bold"), cursor="hand2")
+    btn_b = tk.Button(nav_frame, text="🔍 模式 B：K3 校验", font=("Microsoft YaHei", 12, "bold"), cursor="hand2")
     
-    tk.Label(tab_a, text="应用场景：版本迭代时，抓取元器件的新增、移除、数值修改及空贴变化", 
-             fg="#7F8C8D", bg="#FFFFFF", font=("Microsoft YaHei", 9)).pack(pady=15)
+    btn_a.pack(side='left', expand=True, fill='x', padx=(0, 10), ipady=8)
+    btn_b.pack(side='left', expand=True, fill='x', padx=(0, 0), ipady=8)
     
-    # 使用 LabelFrame 增加模块的包裹感
-    frame_a = ttk.LabelFrame(tab_a, text=" 文件加载配置 ")
-    frame_a.pack(fill='x', padx=25, pady=5)
+    # 建立主工作区容器
+    work_area = tk.Frame(root, bg="#FFFFFF", bd=2, relief=tk.GROOVE)
+    work_area.pack(fill='both', expand=True, padx=20, pady=(0, 20))
+    
+    tab_a = tk.Frame(work_area, bg="#FFFFFF")
+    tab_b = tk.Frame(work_area, bg="#FFFFFF")
+
+    # ======================== 选项卡 1：差异核对面板内容 ========================
+    tk.Label(tab_a, text=" 应用场景：版本迭代时，精准捕获元器件的新增、移除、数值修改及空贴变化 ", 
+             fg="#85929E", bg="#FFFFFF", font=("Microsoft YaHei", 9)).pack(pady=10)
+    frame_a = ttk.LabelFrame(tab_a, text=" 导入配置 (Mode A) ")
+    frame_a.pack(fill='x', padx=30, pady=5)
     
     v_old, v_new = tk.StringVar(), tk.StringVar()
-    
-    f1 = ttk.Frame(frame_a); f1.pack(fill='x', padx=15, pady=10)
-    ttk.Button(f1, text="选择基准旧版", width=14, command=lambda: v_old.set(filedialog.askopenfilename())).pack(side='left')
+    f1 = tk.Frame(frame_a, bg="#FFFFFF"); f1.pack(fill='x', padx=15, pady=8)
+    tk.Button(f1, text="选择基准旧版", width=12, font=font_main, bg="#ECF0F1", relief=tk.GROOVE, bd=2,
+              command=lambda: v_old.set(filedialog.askopenfilename())).pack(side='left')
     ttk.Entry(f1, textvariable=v_old, state='readonly').pack(side='left', fill='x', expand=True, padx=10)
     
-    f2 = ttk.Frame(frame_a); f2.pack(fill='x', padx=15, pady=10)
-    ttk.Button(f2, text="选择待测新版", width=14, command=lambda: v_new.set(filedialog.askopenfilename())).pack(side='left')
+    f2 = tk.Frame(frame_a, bg="#FFFFFF"); f2.pack(fill='x', padx=15, pady=8)
+    tk.Button(f2, text="选择待测新版", width=12, font=font_main, bg="#ECF0F1", relief=tk.GROOVE, bd=2,
+              command=lambda: v_new.set(filedialog.askopenfilename())).pack(side='left')
     ttk.Entry(f2, textvariable=v_new, state='readonly').pack(side='left', fill='x', expand=True, padx=10)
     
-    # 运行按钮定制化 (淡蓝色)
-    style.configure("RunA.TButton", font=("Microsoft YaHei", 11, "bold"), background="#AED6F1", foreground="#1B4F72")
-    ttk.Button(tab_a, text="⚡ 开始执行差异核对", style="RunA.TButton",
-              command=lambda: process_diff(v_old.get(), v_new.get(), os.path.join(get_base_dir(), "BOM_差异对比报告.xlsx"))).pack(pady=25, fill='x', padx=100)
+    tk.Button(tab_a, text="⚡ 开始执行差异核对", font=("Microsoft YaHei", 12, "bold"),
+              bg="#2980B9", fg="white", activebackground="#1F618D", activeforeground="white", 
+              relief=tk.RAISED, bd=5, cursor="hand2", 
+              command=lambda: process_diff(v_old.get(), v_new.get(), os.path.join(get_base_dir(), "BOM_差异对比报告.xlsx"))).pack(pady=20, fill='x', padx=100)
 
-    # ---------------- 选项卡 2：K3 主数据校验 ----------------
-    tab_b = ttk.Frame(notebook)
-    notebook.add(tab_b, text=" 🔍 [模式 B] 首次发板 K3 物料校验 ")
-
-    tk.Label(tab_b, text="应用场景：新六层板打样前，拦截图纸中未绑定 K3 编码或容阻值/封装错配的器件", 
-             fg="#7F8C8D", bg="#FFFFFF", font=("Microsoft YaHei", 9)).pack(pady=15)
-    
-    frame_b = ttk.LabelFrame(tab_b, text=" 文件加载配置 ")
-    frame_b.pack(fill='x', padx=25, pady=5)
+    # ======================== 选项卡 2：K3 主数据校验面板内容 ========================
+    tk.Label(tab_b, text=" 应用场景：新板打样前，三维交叉验证图纸器件是否在 K3 ERP 库中合法存在 ", 
+             fg="#85929E", bg="#FFFFFF", font=("Microsoft YaHei", 9)).pack(pady=10)
+    frame_b = ttk.LabelFrame(tab_b, text=" 导入配置 (Mode B) ")
+    frame_b.pack(fill='x', padx=30, pady=5)
 
     v_ad, v_lib = tk.StringVar(), tk.StringVar()
-    
-    f3 = ttk.Frame(frame_b); f3.pack(fill='x', padx=15, pady=10)
-    ttk.Button(f3, text="AD 导出 BOM", width=14, command=lambda: v_ad.set(filedialog.askopenfilename())).pack(side='left')
+    f3 = tk.Frame(frame_b, bg="#FFFFFF"); f3.pack(fill='x', padx=15, pady=8)
+    tk.Button(f3, text="AD 导出 BOM", width=12, font=font_main, bg="#ECF0F1", relief=tk.GROOVE, bd=2,
+              command=lambda: v_ad.set(filedialog.askopenfilename())).pack(side='left')
     ttk.Entry(f3, textvariable=v_ad, state='readonly').pack(side='left', fill='x', expand=True, padx=10)
     
-    f4 = ttk.Frame(frame_b); f4.pack(fill='x', padx=15, pady=10)
-    ttk.Button(f4, text="公司 K3 总库", width=14, command=lambda: v_lib.set(filedialog.askopenfilename())).pack(side='left')
+    f4 = tk.Frame(frame_b, bg="#FFFFFF"); f4.pack(fill='x', padx=15, pady=8)
+    tk.Button(f4, text="公司 K3 总库", width=12, font=font_main, bg="#ECF0F1", relief=tk.GROOVE, bd=2,
+              command=lambda: v_lib.set(filedialog.askopenfilename())).pack(side='left')
     ttk.Entry(f4, textvariable=v_lib, state='readonly').pack(side='left', fill='x', expand=True, padx=10)
 
-    # 运行按钮定制化 (淡绿色)
-    style.configure("RunB.TButton", font=("Microsoft YaHei", 11, "bold"), background="#A9DFBF", foreground="#186A3B")
-    ttk.Button(tab_b, text="⚡ 开始交叉特征比对", style="RunB.TButton",
-              command=lambda: process_lib_check(v_ad.get(), v_lib.get(), os.path.join(get_base_dir(), "K3物料校验报告.xlsx"))).pack(pady=25, fill='x', padx=100)
+    tk.Button(tab_b, text="⚡ 开始三维交叉比对", font=("Microsoft YaHei", 12, "bold"),
+              bg="#27AE60", fg="white", activebackground="#1D8348", activeforeground="white", 
+              relief=tk.RAISED, bd=5, cursor="hand2", 
+              command=lambda: process_lib_check(v_ad.get(), v_lib.get(), os.path.join(get_base_dir(), "K3物料校验报告.xlsx"))).pack(pady=20, fill='x', padx=100)
 
+    # ==================== [导航引擎的底层路由逻辑] ====================
+    def switch_to_a():
+        btn_a.config(relief=tk.SUNKEN, bg="#2980B9", fg="white", activebackground="#2980B9")
+        btn_b.config(relief=tk.RAISED, bg="#E5E7E9", fg="#A6ACAF", activebackground="#E5E7E9")
+        tab_b.pack_forget() 
+        tab_a.pack(fill='both', expand=True, padx=10, pady=10) 
+        
+    def switch_to_b():
+        btn_b.config(relief=tk.SUNKEN, bg="#27AE60", fg="white", activebackground="#27AE60")
+        btn_a.config(relief=tk.RAISED, bg="#E5E7E9", fg="#A6ACAF", activebackground="#E5E7E9")
+        tab_a.pack_forget() 
+        tab_b.pack(fill='both', expand=True, padx=10, pady=10) 
+
+    btn_a.config(command=switch_to_a)
+    btn_b.config(command=switch_to_b)
+    switch_to_a() 
+    
     root.mainloop()
 
 if __name__ == "__main__":
