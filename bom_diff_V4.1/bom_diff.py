@@ -14,7 +14,7 @@ ALIAS_DICT = {
     'Designator': ['位号', 'designator', 'refdes', 'reference', '编号'],
     'Quantity': ['数量', 'quantity', 'qty', 'count', '用量'], 
     'DNP': ['贴片状态', 'dnp', 'nc', '是否贴片', 'status', '空贴'],
-    'K3_Code': ['k3 no.', 'k3 no', 'k3编码', '物料代码', '物料编码', 'k3 code', '编码'],
+    'K3_Code': ['k3 no.', 'k3 no', 'k3编码', '物料代码', '物料编码', 'k3 code', '编码','k3'],
     'Value': ['value', '值', '参数', '规格型号', '容值', '阻值'],
     'Footprint': ['footprint', '封装', 'package']
 }
@@ -445,6 +445,10 @@ def show_instructions(root):
    - 自动等效换算:100nF=0.1uF,1MR=1M 等。
    - DNP 状态剥离：自动从参数中剔除 DNP/NC/空贴 字符。(需要将DNP参数写在Value中)
    - 智能旁路路由：芯片(U)、电感(L)、二极管(D) 等物料,由于K3中不会存在封装信息,所以屏蔽封装检测,检测value与K3编码
+
+=========================================
+具体使用详情查看内部飞书文档
+https://s17weazhe5w.feishu.cn/wiki/QDXNwjkjriEpdmkqfD0cvmALn2b
    
 =========================================
 ⚠️ 内部管控工具，请勿外传。

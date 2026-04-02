@@ -14,7 +14,7 @@ ALIAS_DICT = {
     'Designator': ['位号', 'designator', 'refdes', 'reference', '编号'],
     'Quantity': ['数量', 'quantity', 'qty', 'count', '用量'], 
     'DNP': ['贴片状态', 'dnp', 'nc', '是否贴片', 'status', '空贴'],
-    'K3_Code': ['k3 no.', 'k3 no', 'k3编码', '物料代码', '物料编码', 'k3 code', '编码'],
+    'K3_Code': ['k3 no.', 'k3 no', 'k3编码', '物料代码', '物料编码', 'k3 code', '编码','k3'],
     'Value': ['value', '值', '参数', '规格型号', '容值', '阻值'],
     'Footprint': ['footprint', '封装', 'package']
 }
