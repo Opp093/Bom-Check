@@ -104,6 +104,278 @@ def is_dnp(val):
         if s.startswith(kw): return True
     return False
 
+def normalize_k3_specs(specs):
+    """K3 库参数清洗：与 AD 参数保持同等符号处理，避免非对称误判"""
+    return normalize_resistance_unit_text(specs).replace('±', '').replace('+/-', '')
+
+def strip_dnp_noise_from_value(val):
+    """从 AD Value 中剥离 DNP/NC/空贴噪音，保留芯片型号中的 NC 字符"""
+    clean_ad_val = str(val).strip().upper()
+    for kw in ['DNP', 'NC']:
+        clean_ad_val = re.sub(r'(?<![A-Z0-9])' + kw + r'(?![A-Z0-9])', '', clean_ad_val)
+    clean_ad_val = re.sub(r'空贴', '', clean_ad_val)
+    clean_ad_val = re.sub(r'\(\s*\)', '', clean_ad_val)
+    clean_ad_val = re.sub(r'(^|[\s_,\/\|;；，]+)-+', r'\1', clean_ad_val)
+    return re.sub(r'^[\s_,\/\|\-]+|[\s_,\/\|\-]+$', '', clean_ad_val)
+
+def split_value_tokens(val):
+    """按 AD 常见分隔符拆分 Value，过滤空片段"""
+    return [s.strip() for s in re.split(r'[_,\/\|\s]+', strip_dnp_noise_from_value(val)) if s.strip()]
+
+def find_value_conflicts(ad_val, k3_specs_upper):
+    """返回 AD Value 中未能在 K3 参数文本里命中的切片"""
+    val_conflicts = []
+    for sv in split_value_tokens(ad_val):
+        sv_eqs = {key for key in build_value_search_keys(sv) if not re.fullmatch(r'\d+(\.\d+)?', key)}
+        if re.fullmatch(r'[±+\-]?\d+(\.\d+)?%', sv):
+            continue
+        if re.fullmatch(r'\d+(\.\d+)?[VAW]', sv):
+            continue
+        if not sv_eqs:
+            text_token = normalize_resistance_unit_text(sv)
+            if text_token and text_token not in k3_specs_upper:
+                val_conflicts.append(sv)
+            continue
+        if not any(eq in k3_specs_upper for eq in sv_eqs):
+            val_conflicts.append(sv)
+    return val_conflicts
+
+def value_matches_k3(ad_val, k3_specs_upper):
+    """判断 AD Value 是否被 K3 参数覆盖"""
+    return len(find_value_conflicts(ad_val, k3_specs_upper)) == 0
+
+def footprint_matches_k3(ad_foot, k3_specs_upper):
+    """判断 AD Footprint 的核心封装码是否被 K3 参数覆盖"""
+    foot_core = get_footprint_core(ad_foot)
+    return (foot_core == '') or (foot_core in k3_specs_upper)
+
+def normalize_resistance_unit_text(val):
+    """把 10Ω / 5.6KΩ 规范成 10R / 5.6K，便于等效匹配"""
+    s = str(val).strip().upper()
+    s = re.sub(r'(\d+(?:\.\d+)?)([KMG])\s*Ω', r'\1\2', s)
+    s = re.sub(r'(\d+(?:\.\d+)?)\s*Ω', r'\1R', s)
+    return s
+
+def extract_electrical_value_tokens(val):
+    """只提取真正的电气主值，避免把 10%、50V、1/10W 等规格噪声当成 Value"""
+    raw = normalize_resistance_unit_text(val)
+    raw = raw.replace('+/-', ' ').replace('±', ' ')
+    raw = re.sub(r'^\s*\(([^()]*)\)\s*$', r'\1', raw)
+    raw = re.sub(r'\([^)]*\)', ' ', raw)
+    raw = re.sub(r'^\s*(0201|0402|0603|0805|1206|1210|2010|2512|3216|3225)\s*[-_/ ]\s*', '', raw)
+
+    tokens = []
+    value_pattern = re.compile(r'(?<![A-Z0-9.])\d+(?:\.\d+)?(?:R|K|M|G|PF|NF|UF|MF|P|N|U|PH|NH|UH|MH|H)(?=[^A-Z0-9]|$)')
+    for token in value_pattern.findall(raw):
+        if token not in tokens:
+            tokens.append(token)
+
+    if not tokens and re.match(r'^\s*0\s*(?:[-_/\s]|$)', raw):
+        tokens.append('0R')
+
+    return tokens
+
+def expand_inductance_value(val):
+    """电感等效值转换：2.2uH = 2200nH，仅处理带 H 的电感单位"""
+    token = str(val).strip().upper()
+    m = re.match(r'^([\d\.]+)(P|N|U|M)?H$', token)
+    if not m:
+        return [token]
+
+    num = float(m.group(1))
+    unit = m.group(2) or ''
+    eqs = {token}
+
+    if unit == 'U':
+        eqs.add(f"{num:g}UH")
+        eqs.add(f"{num*1000:g}NH")
+    elif unit == 'N':
+        eqs.add(f"{num:g}NH")
+        eqs.add(f"{num/1000:g}UH")
+    elif unit == 'M':
+        eqs.add(f"{num:g}MH")
+        eqs.add(f"{num*1000:g}UH")
+    elif unit == '':
+        eqs.add(f"{num:g}H")
+        eqs.add(f"{num*1000000:g}UH")
+
+    return list(eqs)
+
+def expand_electrical_value_token(token):
+    """按单位类型生成等效主值，避免把 uH 当成 uF"""
+    token = str(token).strip().upper()
+    if token.endswith('H'):
+        return expand_inductance_value(token)
+    return expand_value(token)
+
+def extract_tolerance_tokens(val):
+    """提取精度，例如 1%、5%、±10%，用于电阻等需要精度唯一性的类别"""
+    text = str(val).strip().upper().replace('±', '')
+    return sorted(set(re.findall(r'\d+(?:\.\d+)?%', text)))
+
+def get_required_tolerances(ad_val, family):
+    """只有明确要求精度唯一性的类别才强制校验精度"""
+    if family != 'resistor':
+        return []
+    return extract_tolerance_tokens(ad_val)
+
+def get_tolerance_conflicts(ad_val, family, k3_specs_upper):
+    """返回 K3 中缺失的 AD 精度要求"""
+    return [tol for tol in get_required_tolerances(ad_val, family) if tol not in k3_specs_upper]
+
+def build_value_search_keys(val):
+    """为主参数建立可查询的等效值集合，例如 100nF 同时索引 0.1uF"""
+    keys = set()
+    for token in extract_electrical_value_tokens(val):
+        keys.add(token)
+        keys.update(expand_electrical_value_token(token))
+    return {k for k in keys if k}
+
+def add_candidate_index(index, value_key, foot_core, k3_code):
+    """写入候选索引，使用集合避免大库构建时反复线性去重"""
+    if not value_key:
+        return
+    index.setdefault((value_key, foot_core), set()).add(k3_code)
+
+def find_value_footprint_k3_codes(ad_val, ad_foot, designator_text, candidate_index, value_index, code_rank, code_category, code_specs):
+    """用 AD Value + Footprint 通过索引反查所有适配的 K3 编码"""
+    ad_key_sets = []
+    for token in split_value_tokens(ad_val):
+        keys = build_value_search_keys(token)
+        if keys:
+            ad_key_sets.append(keys)
+
+    if not ad_key_sets:
+        return []
+
+    foot_core = get_footprint_core(ad_foot)
+    family = get_designator_family(designator_text)
+    token_code_sets = []
+
+    for keys in ad_key_sets:
+        token_codes = set()
+        for key in keys:
+            if foot_core and family in ['resistor', 'capacitor']:
+                token_codes.update(candidate_index.get((key, foot_core), []))
+            else:
+                token_codes.update(value_index.get((key, ''), []))
+
+        if not token_codes:
+            return []
+        token_code_sets.append(token_codes)
+
+    matched_codes = set.intersection(*token_code_sets)
+    sorted_codes = sorted(matched_codes, key=lambda code: code_rank.get(code, len(code_rank)))
+    sorted_codes = filter_candidate_codes_by_designator(sorted_codes, designator_text, code_category)
+
+    required_tolerances = get_required_tolerances(ad_val, family)
+    if required_tolerances:
+        sorted_codes = [
+            code for code in sorted_codes
+            if all(tol in normalize_k3_specs(code_specs.get(code, '')) for tol in required_tolerances)
+        ]
+
+    return sorted_codes
+
+def normalize_k3_code_for_lookup(code):
+    """仅用于查库的 K3 编码归一化，兼容 025-GJ / 025GJ 这类连字符差异"""
+    return re.sub(r'[\s\-]+', '', str(code).strip().upper())
+
+def split_k3_codes(code_text):
+    """拆分 AD 中可能合并在一个单元格里的多个 K3 编码"""
+    return [c.strip() for c in re.split(r'[,，;；]+', str(code_text)) if c.strip()]
+
+def resolve_k3_codes(code_text, lib_dict, lib_code_lookup):
+    """按原始编码优先、归一化编码兜底，解析 AD K3 到 K3 库真实编码"""
+    resolved_codes = []
+    missing_codes = []
+
+    for code in split_k3_codes(code_text):
+        lib_code = code if code in lib_dict else lib_code_lookup.get(normalize_k3_code_for_lookup(code))
+        if lib_code:
+            if lib_code not in resolved_codes:
+                resolved_codes.append(lib_code)
+        else:
+            missing_codes.append(code)
+
+    return resolved_codes, missing_codes
+
+def get_designator_prefixes(designator_text):
+    """提取位号前缀，例如 R77 -> R、FB1 -> FB"""
+    prefixes = set()
+    for item in re.split(r'[,，\s]+', str(designator_text).upper()):
+        m = re.match(r'([A-Z]+)\d+', item.strip())
+        if m:
+            prefixes.add(m.group(1))
+    return prefixes
+
+def get_designator_family(designator_text):
+    """按位号判断物料大类，用于过滤第二轮候选 K3"""
+    prefix_family = {
+        'R': 'resistor', 'RN': 'resistor',
+        'C': 'capacitor', 'CN': 'capacitor',
+        'L': 'inductor',
+        'FB': 'ferrite',
+    }
+    families = {prefix_family[p] for p in get_designator_prefixes(designator_text) if p in prefix_family}
+    return next(iter(families)) if len(families) == 1 else ''
+
+def get_lib_category(row, spec_text):
+    """从 K3 名称/规格中提取物料大类，辅助候选过滤"""
+    name_text = str(row.get('名称', '')).strip()
+    text = f"{name_text} | {spec_text}"
+    if '磁珠' in text:
+        return 'ferrite'
+    if '电阻' in text:
+        return 'resistor'
+    if '电容' in text:
+        return 'capacitor'
+    if '电感' in text:
+        return 'inductor'
+    return ''
+
+def filter_candidate_codes_by_designator(codes, designator_text, code_category):
+    """根据位号类型过滤候选，避免 R 位号里混入磁珠/电容等 K3"""
+    family = get_designator_family(designator_text)
+    if not family:
+        return codes
+    return [code for code in codes if code_category.get(code, '') == family]
+
+def check_k3_specs_match(ad_val, ad_foot, designator_text, k3_specs_upper):
+    """单个 K3 编码与 AD Value/Footprint 的独立匹配结果"""
+    designator_upper = str(designator_text).strip().upper()
+    foot_core = get_footprint_core(ad_foot)
+    is_rc_passive = re.match(r'^(R|C|RN|CN)\d+', designator_upper)
+
+    if is_rc_passive:
+        match_foot = (foot_core == '') or (foot_core in k3_specs_upper)
+    else:
+        match_foot = True
+
+    val_conflicts = find_value_conflicts(ad_val, k3_specs_upper)
+    tolerance_conflicts = get_tolerance_conflicts(ad_val, get_designator_family(designator_text), k3_specs_upper)
+    match_val = len(val_conflicts) == 0 and len(tolerance_conflicts) == 0
+    return match_val, match_foot, val_conflicts, tolerance_conflicts
+
+def summarize_k3_mismatches(k3_results, ad_foot):
+    """生成多 K3 独立校验后的简短冲突摘要"""
+    conflicts = []
+    for code, match_val, match_foot, val_conflicts, tolerance_conflicts in k3_results:
+        if match_val and match_foot:
+            continue
+        parts = []
+        if not match_val:
+            detail_parts = []
+            if val_conflicts:
+                detail_parts.append(','.join(val_conflicts))
+            if tolerance_conflicts:
+                detail_parts.append("精度" + ','.join(tolerance_conflicts))
+            parts.append(f"参数({';'.join(detail_parts)})")
+        if not match_foot:
+            parts.append(f"封装({ad_foot})")
+        conflicts.append(f"{code}:{'/'.join(parts)}")
+    return "；".join(conflicts)
+
 def get_base_dir():
     """物理绝对寻址：防止 EXE 打包后找不到路径"""
     if getattr(sys, 'frozen', False): 
@@ -298,19 +570,49 @@ def process_lib_check(ad_path, lib_path, output_filename):
         messagebox.showerror("识别失败", "公司 K3 库中未识别到'编码'列，请检查表头。")
         return
 
-    # 1. 构建高速哈希字典
+    # 1. 构建高速哈希字典 + Value/Footprint 倒排索引
     lib_dict = {}
+    lib_code_lookup = {}
+    candidate_index = {}
+    value_index = {}
+    candidate_code_rank = {}
+    code_category = {}
+    code_specs = {}
     for _, row in lib_df.iterrows():
         k3_code = str(row['K3_Code']).strip()
         if k3_code and k3_code != 'nan':
             specs = [str(row[c]).strip() for c in lib_df.columns if c != 'K3_Code' and str(row[c]).strip() not in ['', 'nan']]
-            lib_dict[k3_code] = " | ".join(specs)
+            spec_text = " | ".join(specs)
+            if k3_code not in lib_dict:
+                candidate_code_rank[k3_code] = len(candidate_code_rank)
+            lib_dict[k3_code] = spec_text
+            code_category[k3_code] = get_lib_category(row, spec_text)
+            code_specs[k3_code] = spec_text
+
+            normalized_k3_code = normalize_k3_code_for_lookup(k3_code)
+            if normalized_k3_code not in lib_code_lookup:
+                lib_code_lookup[normalized_k3_code] = k3_code
+            elif lib_code_lookup[normalized_k3_code] != k3_code:
+                lib_code_lookup[normalized_k3_code] = None
+
+            k3_value_text = str(row.get('Value', '')).strip()
+            k3_foot_text = str(row.get('Footprint', '')).strip()
+            if k3_value_text in ['', 'nan']:
+                k3_value_text = spec_text
+            if k3_foot_text in ['', 'nan']:
+                k3_foot_text = spec_text
+
+            foot_core = get_footprint_core(k3_foot_text)
+            for value_key in build_value_search_keys(f"{k3_value_text} | {spec_text}"):
+                add_candidate_index(candidate_index, value_key, foot_core, k3_code)
+                add_candidate_index(value_index, value_key, '', k3_code)
 
     # 2. 链路状态指示灯：防御断路风险
     messagebox.showinfo("底层诊断", f"数据总线加载完毕！\n\nAD 待测物料数: {len(ad_df)} 项\nK3 标准库物料数: {len(lib_dict)} 项\n\n注：如果K3库数量极少，请确认导出的库是否包含了所有元件大类！")
 
-    # 3. 三重寻址交叉碰撞匹配
+    # 3. 三重校验 + Value/Footprint 候选编码反查
     excel_data = []
+    candidate_cache = {}
     for _, row in ad_df.iterrows():
         k3_code = str(row.get('K3_Code', '')).strip()
         ad_val = str(row.get('Value', '')).strip()
@@ -322,6 +624,7 @@ def process_lib_check(ad_path, lib_path, output_filename):
             '数量 (Qty)': ad_qty,  # <--- [新增] 将数量接入输出总线
             'AD K3编码': k3_code,
             'AD 原理图参数': f"Val: {ad_val} | Foot: {ad_foot}",
+            'Value+Footprint匹配K3编码': '',
             '校验状态': '',
             '公司 K3 库标准参数': ''
         }
@@ -330,17 +633,20 @@ def process_lib_check(ad_path, lib_path, output_filename):
         # 状态机 A：缺件或彻底找不到
         if k3_code in ['', 'nan', 'NONE']:
             row_data['校验状态'] = '[!] 缺少编码'
-        elif k3_code not in lib_dict:
+        else:
+            lib_k3_codes, missing_k3_codes = resolve_k3_codes(k3_code, lib_dict, lib_code_lookup)
+
+        if row_data['校验状态']:
+            pass
+        elif missing_k3_codes or not lib_k3_codes:
             row_data['校验状态'] = '[x] 库中无此物料'
             
         # 状态机 B：编码存在 -> 启动深度交叉验证
         else:
-            k3_specs_upper = str(lib_dict[k3_code]).upper()
+            lib_specs_text = " | ".join(lib_dict[lib_code] for lib_code in lib_k3_codes)
             # ================= [核心终极修复：对称底噪抹平] =================
             # AD 的信号在底层被抹去了 Ω 和 ±，K3 库也必须同等抹去，否则会引发非对称断路！
-            k3_specs_upper = k3_specs_upper.replace('Ω', '').replace('±', '').replace('+/-', '')
             # ================================================================
-            designator_upper = str(row.get('Designator', '')).strip().upper()
             
             # ================= [防线升级 1] DNP 空贴噪声剥离与状态捕捉 =================
             is_row_dnp = False
@@ -351,55 +657,41 @@ def process_lib_check(ad_path, lib_path, output_filename):
             elif is_dnp(ad_val):
                 is_row_dnp = True
                 
-            # 从 Value 中强行洗掉 DNP/NC/空贴 等噪音字眼，防止污染后续的切片校验
-            clean_ad_val = ad_val.upper()
-            
-            # 【终极修复】应用严格的字母数字边界判定，彻底放过 NC7SZ 等芯片型号
-            for kw in ['DNP', 'NC']:
-                # (?<![A-Z0-9]) 确保前面不是字母或数字
-                # (?![A-Z0-9])  确保后面不是字母或数字
-                clean_ad_val = re.sub(r'(?<![A-Z0-9])' + kw + r'(?![A-Z0-9])', '', clean_ad_val)
-            
-            # 中文“空贴”不会与芯片型号重合，直接无脑切除即可
-            clean_ad_val = re.sub(r'空贴', '', clean_ad_val)
+            # DNP/NC/空贴 噪音会在 find_value_conflicts() 内部统一清洗
             # =========================================================================
 
-            # --- 通道 1：封装滤波器检测 (加装智能旁路路由) ---
-            foot_core = get_footprint_core(ad_foot)
-            is_rc_passive = re.match(r'^(R|C|RN|CN)\d+', designator_upper)
-            
-            if is_rc_passive:
-                match_foot = (foot_core == '') or (foot_core in k3_specs_upper)
-            else:
-                match_foot = True
-            
-            # --- 通道 2：参数裂变器扫描 (多维交叉切片) ---
-            # 【注意】这里使用洗净了 DNP 噪音的 clean_ad_val 进行切片
-            sub_vals = [s.strip() for s in re.split(r'[_,\/\|\s]+', clean_ad_val) if s.strip()]
-            
-            match_val = True
-            val_conflicts = [] 
-            
-            for sv in sub_vals:
-                # [核心修正] 拆除 K3 编码套娃旁路，强制对 Value 列的所有切片进行物理参数校验
-                sv_eqs = expand_value(sv) 
-                if not any(eq in k3_specs_upper for eq in sv_eqs):
-                    match_val = False
-                    val_conflicts.append(sv)
+            k3_results = []
+            for lib_code in lib_k3_codes:
+                match_val, match_foot, val_conflicts, tolerance_conflicts = check_k3_specs_match(
+                    ad_val, ad_foot, row.get('Designator', ''), normalize_k3_specs(lib_dict[lib_code])
+                )
+                k3_results.append((lib_code, match_val, match_foot, val_conflicts, tolerance_conflicts))
             
             # --- 与门仲裁 ---
             # 如果捕捉到了 DNP 状态，准备好专属后缀标签
             dnp_tag = " (空贴/DNP)" if is_row_dnp else ""
             
-            if match_val and match_foot:
+            if all(match_val and match_foot for _, match_val, match_foot, _, _ in k3_results):
                 row_data['校验状态'] = f'[√] 完美匹配{dnp_tag}'
             else:
-                conflicts = []
-                if not match_val: conflicts.append(f"参数({','.join(val_conflicts)})冲突")
-                if not match_foot: conflicts.append(f"封装({ad_foot})冲突")
-                row_data['校验状态'] = f'[!] {", ".join(conflicts)}{dnp_tag}'
+                conflict_text = summarize_k3_mismatches(k3_results, ad_foot)
+                row_data['校验状态'] = f'[!] K3编码不匹配({conflict_text}){dnp_tag}'
                 
-            row_data['公司 K3 库标准参数'] = lib_dict[k3_code]
+            row_data['公司 K3 库标准参数'] = lib_specs_text
+
+        if row_data['校验状态'] and '[√]' not in row_data['校验状态']:
+            candidate_key = (
+                ad_val.upper(),
+                ad_foot.upper(),
+                get_designator_family(row.get('Designator', ''))
+            )
+            if candidate_key not in candidate_cache:
+                matched_codes = find_value_footprint_k3_codes(
+                    ad_val, ad_foot, row.get('Designator', ''),
+                    candidate_index, value_index, candidate_code_rank, code_category, code_specs
+                )
+                candidate_cache[candidate_key] = '；'.join(matched_codes) or '未匹配'
+            row_data['Value+Footprint匹配K3编码'] = candidate_cache[candidate_key]
             
         # ==================== [核心修复：焊接数据输出引脚] ====================
         excel_data.append(row_data) 
@@ -407,10 +699,16 @@ def process_lib_check(ad_path, lib_path, output_filename):
 
     # 循环彻底结束后，再将收集到的数据转化为表格并排序
     result_df = pd.DataFrame(excel_data).fillna('')
-    result_df.sort_values(by=['校验状态', '位号 (Designator)'], inplace=True)
-
-    result_df = pd.DataFrame(excel_data).fillna('')
-    result_df.sort_values(by=['校验状态', '位号 (Designator)'], inplace=True)
+    status_order = {'[!]': 0, '[x]': 1, '[√]': 2}
+    result_df['_颜色分类排序'] = result_df['校验状态'].apply(
+        lambda val: next((order for key, order in status_order.items() if key in str(val)), 9)
+    )
+    result_df.sort_values(
+        by=['_颜色分类排序', 'Value+Footprint匹配K3编码', '校验状态', '位号 (Designator)'],
+        inplace=True,
+        kind='stable'
+    )
+    result_df.drop(columns=['_颜色分类排序'], inplace=True)
     result_df.to_excel(output_filename, index=False)
     render_excel(output_filename, 'check')
 
@@ -443,9 +741,11 @@ def render_excel(filename, mode):
 
     elif mode == 'check':
         fills = {'[x]': soft_red, '[!]': soft_orange, '[√]': soft_green}
+        headers = [str(cell.value) for cell in ws[1]]
+        status_col = headers.index('校验状态') + 1 if '校验状态' in headers else 5
         for row in range(2, ws.max_row + 1):
-            # [核心修正] 因为插入了数量列，校验状态偏移到了第 5 列，寻址指针随之修改
-            val = str(ws.cell(row=row, column=5).value) 
+            # [核心修正] 自动定位校验状态列，避免后续新增列导致色彩渲染错位
+            val = str(ws.cell(row=row, column=status_col).value) 
             for key in fills:
                 if key in val:
                     for c in ws[row]: 
@@ -494,7 +794,7 @@ def show_instructions(root):
 
     # ==================== [核心重构：防篡改的内置固化存储] ====================
     # 👨‍💻 开发者专属修改区：直接在这里修改文字，然后用 PyInstaller 重新打包即可！
-    developer_instructions = """欢迎使用 Excite Bom-check HW V4.1!
+    developer_instructions = """欢迎使用 Excite Bom-check HW V4.3!
 
 【模式 A:硬件改版差异核对】
 1. 作用：对比新旧两份 BOM,提取新增、移除、修改(包括变为空贴)的器件。
@@ -534,7 +834,7 @@ https://s17weazhe5w.feishu.cn/wiki/QDXNwjkjriEpdmkqfD0cvmALn2b
 
 def run_app():
     root = tk.Tk()
-    root.title("BOM-Check V4.1 ")
+    root.title("BOM-Check V4.3 ")
     root.geometry("760x540") # 稍微拉宽以容纳帮助按钮
     root.configure(bg="#EAECEE") 
     
@@ -545,7 +845,7 @@ def run_app():
     
     gradient = GradientHeader(header_frame, color1="#1A2980", color2="#26D0CE", highlightthickness=0)
     gradient.place(relwidth=1, relheight=1)
-    tk.Label(header_frame, text="Excite BOM-Check HW V4.1", font=("Microsoft YaHei", 18, "bold"), 
+    tk.Label(header_frame, text="Excite BOM-Check HW V4.3", font=("Microsoft YaHei", 18, "bold"), 
              fg="white", bg="#1A2980").place(relx=0.5, rely=0.5, anchor="center")
 
     # ---------------- 2. 引入基础样式 ----------------
